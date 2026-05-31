@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Bdphile Momox — Cache</title>
+    <style>
+      body {
+        font: 14px/1.5 system-ui, sans-serif;
+        max-width: 32rem;
+        margin: 1.5rem auto;
+        padding: 0 1rem;
+        color: #222;
+      }
+      h1 { font-size: 1.15rem; }
+      fieldset {
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin: 1rem 0;
+      }
+      label { display: block; margin: 0.5rem 0; }
+      input[type="number"] { width: 4rem; }
+      button {
+        margin: 0.35rem 0.35rem 0.35rem 0;
+        padding: 0.4rem 0.75rem;
+        cursor: pointer;
+      }
+      #stats { color: #444; font-size: 0.9rem; }
+      .ok { color: #1a7f37; }
+    </style>
+  </head>
+  <body>
+    <h1>Cache des prix Momox</h1>
+    <p>
+      Les données sont stockées localement dans Firefox (<code>storage.local</code>),
+      par EAN Momox et par album Bdphile. Tant qu’une entrée est valide, aucun appel
+      réseau n’est fait — idéal avec la limite de débit Momox.
+    </p>
+
+    <p id="stats">Chargement…</p>
+    <p id="pauseState"></p>
+
+    <fieldset>
+      <legend>Durée de conservation</legend>
+      <label>
+        Prix Momox (jours)
+        <input type="number" id="momoxTtl" min="1" max="90" value="14" />
+      </label>
+      <label>
+        EAN Bdphile par album (jours)
+        <input type="number" id="bdphileTtl" min="1" max="365" value="90" />
+      </label>
+      <button type="button" id="saveSettings">Enregistrer</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Vider le cache</legend>
+      <button type="button" id="clearMomox">Prix Momox seulement</button>
+      <button type="button" id="clearBdphile">EAN Bdphile seulement</button>
+      <button type="button" id="clearAll">Tout vider</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Limite Momox (429 / IP)</legend>
+      <p style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #444">
+        Après trop de requêtes, l’extension se met en pause 1 h pour ne pas aggraver le blocage.
+      </p>
+      <button type="button" id="clearCooldown">Reprendre les appels Momox maintenant</button>
+    </fieldset>
+
+    <p id="message"></p>
+    <script src="options.js"></script>
+  </body>
+</html>

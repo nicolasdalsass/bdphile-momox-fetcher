@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Bdphile Momox Prices",
+  "version": "1.0.6",
+  "description": "Affiche le prix de rachat Momox sur les couvertures de votre bdthèque Bdphile.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bdphile-momox-prices@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": ["storage", "cookies"],
+  "host_permissions": [
+    "https://www.bdphile.fr/*",
+    "https://www.momox.fr/*",
+    "https://api.momox.de/*"
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "background": {
+    "scripts": ["cache.js", "background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.bdphile.fr/bdtheque/album*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.momox.fr/*"],
+      "js": ["momox-token.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon.svg",
+    "32": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg",
+    "128": "icons/icon.svg"
+  }
+}
