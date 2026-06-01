@@ -9,10 +9,9 @@
       "strict_min_version": "109.0"
     }
   },
-  "permissions": ["storage", "cookies"],
+  "permissions": ["storage", "alarms"],
   "host_permissions": [
     "https://www.bdphile.fr/*",
-    "https://www.momox.fr/*",
     "https://api.momox.de/*"
   ],
   "options_ui": {
@@ -22,16 +21,21 @@
   "background": {
     "scripts": ["cache.js", "background.js"]
   },
+  "action": {
+    "default_title": "Bdphile Momox",
+    "default_icon": {
+      "16": "icons/icon.svg",
+      "32": "icons/icon.svg",
+      "48": "icons/icon.svg",
+      "96": "icons/icon.svg",
+      "128": "icons/icon.svg"
+    }
+  },
   "content_scripts": [
     {
       "matches": ["https://www.bdphile.fr/bdtheque/album*"],
       "js": ["content.js"],
       "css": ["content.css"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://www.momox.fr/*"],
-      "js": ["momox-token.js"],
       "run_at": "document_idle"
     }
   ],

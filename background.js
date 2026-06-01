@@ -15,6 +15,10 @@ const MOMOX_429_MAX_RETRIES = 2;
 const MOMOX_429_BASE_DELAY_MS = 4000;
 /** After 429/403, stop all Momox calls until this cooldown elapses. */
 const MOMOX_COOLDOWN_DEFAULT_MS = 60 * 60 * 1000;
+const MOMOX_WORK_QUEUE_KEY = "momoxPendingQueue";
+const BDPHILE_ALBUM_QUEUE_KEY = "bdphilePendingAlbums";
+const MOMOX_WORK_ALARM = "momoxQueueTick";
+const MOMOX_WORK_BATCH_SIZE = 3;
 
 const FETCH_HEADERS = {
   Accept: "application/json, text/html, */*",
@@ -28,6 +32,9 @@ const bdphileInflight = new Map();
 
 let momoxQueue = Promise.resolve();
 let lastMomoxRequestAt = 0;
+let queueTickRunning = false;
+let momoxFetchInProgress = false;
+const extAction = ext.action ?? ext.browserAction;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -43,38 +50,8 @@ function parseEanFromHtml(html) {
   return match ? normalizeEan(match[1]) : null;
 }
 
-function extractApiTokenFromHtml(html) {
-  const patterns = [
-    /X-API-TOKEN['"]\s*[:=]\s*['"]([a-f0-9]{40})['"]/i,
-    /apiToken['"]\s*[:=]\s*['"]([a-f0-9]{40})['"]/i,
-    /api[_-]?token['"]\s*[:=]\s*['"]([a-f0-9]{40})['"]/i,
-  ];
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match) return match[1];
-  }
-  return null;
-}
-
-async function getMomoxApiToken() {
-  const stored = await ext.storage.local.get("momoxApiToken");
-  return stored.momoxApiToken || DEFAULT_MOMOX_API_TOKEN;
-}
-
-async function refreshMomoxApiTokenFromSite() {
-  try {
-    const response = await fetch("https://www.momox.fr/", {
-      credentials: "include",
-      headers: { ...FETCH_HEADERS, Accept: "text/html" },
-    });
-    if (!response.ok) return;
-    const token = extractApiTokenFromHtml(await response.text());
-    if (token) {
-      await ext.storage.local.set({ momoxApiToken: token });
-    }
-  } catch {
-    // ignore
-  }
+function getMomoxApiToken() {
+  return DEFAULT_MOMOX_API_TOKEN;
 }
 
 function runOnMomoxQueue(task) {
@@ -98,6 +75,119 @@ async function clearMomoxCooldown() {
   await ext.storage.local.remove("momoxCooldownUntil");
 }
 
+async function getPendingQueueMap() {
+  const stored = await ext.storage.local.get(MOMOX_WORK_QUEUE_KEY);
+  return stored[MOMOX_WORK_QUEUE_KEY] ?? {};
+}
+
+async function savePendingQueueMap(queueMap) {
+  await ext.storage.local.set({ [MOMOX_WORK_QUEUE_KEY]: queueMap });
+  await updateActionBadge();
+}
+
+async function getPendingAlbumMap() {
+  const stored = await ext.storage.local.get(BDPHILE_ALBUM_QUEUE_KEY);
+  return stored[BDPHILE_ALBUM_QUEUE_KEY] ?? {};
+}
+
+async function savePendingAlbumMap(queueMap) {
+  await ext.storage.local.set({ [BDPHILE_ALBUM_QUEUE_KEY]: queueMap });
+  await updateActionBadge();
+}
+
+async function enqueueAlbumIds(albumIds) {
+  if (!Array.isArray(albumIds) || !albumIds.length) return;
+  const queueMap = await getPendingAlbumMap();
+  const now = Date.now();
+  for (const albumId of albumIds) {
+    if (!albumId || queueMap[albumId]) continue;
+    queueMap[albumId] = { addedAt: now };
+  }
+  await savePendingAlbumMap(queueMap);
+}
+
+async function enqueueEanForFetch(ean) {
+  if (!ean) return;
+  const queueMap = await getPendingQueueMap();
+  if (queueMap[ean]) return;
+  queueMap[ean] = { attempts: 0, nextAttemptAt: Date.now(), lastError: "" };
+  await savePendingQueueMap(queueMap);
+}
+
+async function markEanFetchSuccess(ean) {
+  const queueMap = await getPendingQueueMap();
+  if (!queueMap[ean]) return;
+  delete queueMap[ean];
+  await savePendingQueueMap(queueMap);
+}
+
+async function markEanFetchFailure(ean, error, pausedUntil) {
+  const queueMap = await getPendingQueueMap();
+  const previous = queueMap[ean] ?? { attempts: 0, nextAttemptAt: Date.now(), lastError: "" };
+  const attempts = previous.attempts + 1;
+  const baseDelay = Math.min(30 * 60 * 1000, 15_000 * Math.pow(2, Math.min(attempts, 8)));
+  const jitter = Math.floor(Math.random() * 1500);
+  const nextAttemptAt = Math.max(Date.now() + baseDelay + jitter, pausedUntil ?? 0);
+  queueMap[ean] = {
+    attempts,
+    nextAttemptAt,
+    lastError: error instanceof Error ? error.message : String(error ?? ""),
+  };
+  await savePendingQueueMap(queueMap);
+}
+
+async function updateActionBadge() {
+  if (!extAction?.setBadgeText) return;
+  const queueMap = await getPendingQueueMap();
+  const queueItems = Object.values(queueMap);
+  const pending = queueItems.length;
+  const pause = await getMomoxPauseState();
+  const isPaused = Boolean(pause);
+  const now = Date.now();
+  const readyCount = queueItems.filter(
+    (item) => (item?.nextAttemptAt ?? 0) <= now
+  ).length;
+  const earliestNextAttemptAt = queueItems.reduce((min, item) => {
+    const ts = item?.nextAttemptAt ?? now;
+    return Math.min(min, ts);
+  }, Number.POSITIVE_INFINITY);
+  const hasFutureRetries =
+    pending > 0 &&
+    Number.isFinite(earliestNextAttemptAt) &&
+    earliestNextAttemptAt > now;
+  const nextRetryMins = hasFutureRetries
+    ? Math.max(1, Math.ceil((earliestNextAttemptAt - now) / 60000))
+    : 0;
+
+  const text = isPaused
+    ? "Zz"
+    : pending > 0
+      ? String(Math.min(pending, 99))
+      : "";
+  await extAction.setBadgeText({ text });
+  await extAction.setBadgeBackgroundColor({
+    color: isPaused ? "#9b1c1c" : momoxFetchInProgress ? "#2563eb" : "#1a7f37",
+  });
+  if (extAction.setTitle) {
+    let statusLine = "IDLE_EMPTY";
+    if (isPaused) {
+      const mins = Math.ceil((pause.remainingMs ?? 0) / 60000);
+      statusLine = `SLEEPING_COOLDOWN (~${Math.max(mins, 0)} min)`;
+    } else if (momoxFetchInProgress) {
+      statusLine = "ACTIVE_FETCH";
+    } else if (pending > 0 && readyCount > 0) {
+      statusLine = `QUEUED_WAIT (${readyCount} pret)`;
+    } else if (hasFutureRetries) {
+      statusLine = `QUEUED_RETRY_AT (~${nextRetryMins} min)`;
+    } else if (pending > 0) {
+      statusLine = "QUEUED_WAIT";
+    }
+    await extAction.setTitle({
+      title: `Bdphile Momox\nEtat: ${statusLine}\nEAN en attente: ${pending}`,
+    });
+  }
+}
+
 async function getMomoxPauseState() {
   const until = await getMomoxCooldownUntil();
   if (Date.now() >= until) return null;
@@ -112,18 +202,8 @@ async function waitForMomoxSlot() {
   lastMomoxRequestAt = Date.now();
 }
 
-async function cookieHeaderFor(url) {
-  const cookies = await ext.cookies.getAll({ url });
-  if (!cookies.length) return "";
-  return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-}
-
 async function fetchWithCookies(url, init = {}) {
-  const cookie = await cookieHeaderFor(url);
   const headers = { ...FETCH_HEADERS, ...init.headers };
-  if (cookie) {
-    headers.Cookie = cookie;
-  }
 
   return fetch(url, {
     ...init,
@@ -141,8 +221,6 @@ async function requestMomoxOfferOnce(ean, token) {
       "X-API-TOKEN": token,
       "X-MARKETPLACE-ID": MOMOX_MARKETPLACE,
       "X-CLIENT-VERSION": MOMOX_CLIENT_VERSION,
-      Referer: "https://www.momox.fr/",
-      Origin: "https://www.momox.fr",
     },
   });
 
@@ -197,7 +275,7 @@ function isMomoxThrottleStatus(status) {
   return status === 429 || status === 403;
 }
 
-async function fetchMomoxOfferData(ean, allowTokenRefresh = true) {
+async function fetchMomoxOfferData(ean) {
   const hit = await cache.readMomox(ean);
   if (hit) {
     return { offer: hit.data, fromCache: true, cachedAt: hit.fetchedAt, cacheAge: hit.ageLabel };
@@ -228,26 +306,27 @@ async function fetchMomoxOfferData(ean, allowTokenRefresh = true) {
       }
 
       await waitForMomoxSlot();
-      let token = await getMomoxApiToken();
+      const token = getMomoxApiToken();
       try {
+        momoxFetchInProgress = true;
+        await updateActionBadge();
         const data = await requestMomoxOffer(ean, token);
         await cache.writeMomox(ean, data);
+        await markEanFetchSuccess(ean);
         return { offer: data, fromCache: false };
       } catch (firstError) {
         if (isMomoxThrottleStatus(firstError?.status)) {
           const cooldown =
             firstError.retryAfterMs ?? MOMOX_COOLDOWN_DEFAULT_MS;
           await setMomoxCooldown(cooldown);
+          await markEanFetchFailure(ean, firstError, Date.now() + cooldown);
           throw firstError;
         }
-        if (!allowTokenRefresh) {
-          throw firstError;
-        }
-        await refreshMomoxApiTokenFromSite();
-        token = await getMomoxApiToken();
-        const data = await requestMomoxOffer(ean, token);
-        await cache.writeMomox(ean, data);
-        return { offer: data, fromCache: false };
+        await markEanFetchFailure(ean, firstError);
+        throw firstError;
+      } finally {
+        momoxFetchInProgress = false;
+        await updateActionBadge();
       }
     }).finally(() => {
       momoxInflight.delete(ean);
@@ -255,6 +334,54 @@ async function fetchMomoxOfferData(ean, allowTokenRefresh = true) {
     momoxInflight.set(ean, pending);
   }
   return pending;
+}
+
+async function getQueueBatch(now = Date.now()) {
+  const queueMap = await getPendingQueueMap();
+  return Object.entries(queueMap)
+    .filter(([, item]) => (item?.nextAttemptAt ?? 0) <= now)
+    .sort((a, b) => (a[1].nextAttemptAt ?? 0) - (b[1].nextAttemptAt ?? 0))
+    .slice(0, MOMOX_WORK_BATCH_SIZE)
+    .map(([ean]) => ean);
+}
+
+async function popAlbumBatch(limit = 5) {
+  const queueMap = await getPendingAlbumMap();
+  const ids = Object.keys(queueMap).slice(0, limit);
+  if (!ids.length) return [];
+  for (const id of ids) {
+    delete queueMap[id];
+  }
+  await savePendingAlbumMap(queueMap);
+  return ids;
+}
+
+async function processPendingQueueTick() {
+  if (queueTickRunning) return;
+  queueTickRunning = true;
+  try {
+    const pause = await getMomoxPauseState();
+    const albumIds = await popAlbumBatch(5);
+    for (const albumId of albumIds) {
+      await resolveEanForAlbum(albumId);
+    }
+    if (pause) return;
+
+    const eans = await getQueueBatch();
+    for (const ean of eans) {
+      try {
+        await fetchMomoxOfferData(ean);
+      } catch (error) {
+        if (error?.pausedUntil) {
+          await markEanFetchFailure(ean, error, error.pausedUntil);
+        } else if (!isMomoxThrottleStatus(error?.status)) {
+          await markEanFetchFailure(ean, error);
+        }
+      }
+    }
+  } finally {
+    queueTickRunning = false;
+  }
 }
 
 async function fetchBdphileAlbumHtml(albumId) {
@@ -269,6 +396,9 @@ async function fetchBdphileAlbumHtml(albumId) {
 async function resolveEanForAlbum(albumId) {
   const cached = await cache.readBdphileEan(albumId);
   if (cached !== undefined) {
+    if (cached) {
+      await enqueueEanForFetch(cached);
+    }
     return { ean: cached, fromCache: true };
   }
 
@@ -279,6 +409,9 @@ async function resolveEanForAlbum(albumId) {
 
   const ean = parseEanFromHtml(html);
   await cache.writeBdphileEan(albumId, ean);
+  if (ean) {
+    await enqueueEanForFetch(ean);
+  }
 
   const needsLogin =
     !ean &&
@@ -352,6 +485,40 @@ async function getAlbumMomoxPrice(albumId, options = {}) {
   return pending;
 }
 
+function startQueueWorker() {
+  if (ext.alarms?.create) {
+    ext.alarms.create(MOMOX_WORK_ALARM, { periodInMinutes: 1 });
+  }
+  void processPendingQueueTick();
+  void updateActionBadge();
+}
+
+if (ext.alarms?.onAlarm) {
+  ext.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name !== MOMOX_WORK_ALARM) return;
+    void processPendingQueueTick();
+  });
+}
+
+if (ext.runtime?.onStartup) {
+  ext.runtime.onStartup.addListener(() => {
+    startQueueWorker();
+  });
+}
+if (ext.runtime?.onInstalled) {
+  ext.runtime.onInstalled.addListener(() => {
+    startQueueWorker();
+  });
+}
+if (extAction?.onClicked) {
+  extAction.onClicked.addListener(() => {
+    if (ext.runtime?.openOptionsPage) {
+      void ext.runtime.openOptionsPage();
+    }
+  });
+}
+startQueueWorker();
+
 ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "getAlbumMomoxPrice") {
     getAlbumMomoxPrice(message.albumId, {
@@ -369,19 +536,6 @@ ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === "setMomoxApiToken" && message.token) {
-    ext.storage.local
-      .set({ momoxApiToken: message.token })
-      .then(() => sendResponse({ ok: true }))
-      .catch((err) =>
-        sendResponse({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        })
-      );
-    return true;
-  }
-
   if (message?.type === "getMomoxPauseState") {
     getMomoxPauseState()
       .then((pause) => sendResponse({ ok: true, pause }))
@@ -391,15 +545,26 @@ ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === "clearMomoxCooldown") {
     clearMomoxCooldown()
-      .then(() => sendResponse({ ok: true }))
+      .then(async () => {
+        await updateActionBadge();
+        sendResponse({ ok: true });
+      })
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
   }
 
   if (message?.type === "getCacheStats") {
-    cache
-      .getStats()
-      .then((stats) => sendResponse({ ok: true, stats }))
+    Promise.all([cache.getStats(), getPendingQueueMap(), getPendingAlbumMap()])
+      .then(([stats, queueMap, albumMap]) =>
+        sendResponse({
+          ok: true,
+          stats: {
+            ...stats,
+            pendingEans: Object.keys(queueMap).length,
+            pendingAlbums: Object.keys(albumMap).length,
+          },
+        })
+      )
       .catch((err) =>
         sendResponse({ ok: false, error: String(err) })
       );
@@ -416,7 +581,20 @@ ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       action = cache.clearAll().then((r) => r.momox + r.bdphile);
     }
     Promise.resolve(action)
-      .then((removed) => sendResponse({ ok: true, removed }))
+      .then(async (removed) => {
+        await updateActionBadge();
+        sendResponse({ ok: true, removed });
+      })
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  if (message?.type === "registerAlbumIds") {
+    enqueueAlbumIds(message.albumIds)
+      .then(() => {
+        void processPendingQueueTick();
+        sendResponse({ ok: true });
+      })
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
   }

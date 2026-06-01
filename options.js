@@ -21,11 +21,11 @@ async function refreshStats() {
     statsEl.textContent = "Impossible de lire le cache.";
     return;
   }
-  const { momoxOffers, bdphileEans, bytesApprox, settings } = statsRes.stats;
+  const { momoxOffers, bdphileEans, pendingEans, pendingAlbums, bytesApprox, settings } = statsRes.stats;
   momoxTtlEl.value = settings.momoxTtlDays;
   bdphileTtlEl.value = settings.bdphileEanTtlDays;
   const kb = Math.round(bytesApprox / 1024);
-  statsEl.textContent = `${momoxOffers} prix Momox · ${bdphileEans} albums Bdphile · ~${kb} Ko`;
+  statsEl.textContent = `${momoxOffers} prix Momox · ${bdphileEans} albums Bdphile · ${pendingAlbums ?? 0} albums en attente · ${pendingEans ?? 0} EAN en attente · ~${kb} Ko`;
 
   if (pauseRes?.ok && pauseRes.pause) {
     const mins = Math.ceil(pauseRes.pause.remainingMs / 60000);
